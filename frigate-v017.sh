@@ -228,7 +228,7 @@ msg_info "Building Nginx with custom modules"
 # Fix potential issues with the build script for Debian 12/13
 if [[ -f /opt/frigate/docker/main/build_nginx.sh ]]; then
     # Ensure compatibility with Debian versions
-    sed -i 's|if.*"$VERSION_ID" == "12".*|if [[ "$VERSION_ID" =~ ^(12|13)$ ]]; then|g' /opt/frigate/docker/main/build_nginx.sh
+    sed -i 's/if.*"$VERSION_ID" == "12".*/if [[ "$VERSION_ID" =~ ^(12|13)$ ]]; then/g' /opt/frigate/docker/main/build_nginx.sh
 
     # Try building nginx with verbose output to catch errors
     if bash /opt/frigate/docker/main/build_nginx.sh; then
@@ -302,7 +302,7 @@ fi
 msg_info "Building SQLite with custom modules"
 if [[ -f /opt/frigate/docker/main/build_sqlite_vec.sh ]]; then
     # Ensure compatibility with Debian versions
-    sed -i 's|if.*"$VERSION_ID" == "12".*|if [[ "$VERSION_ID" =~ ^(12|13)$ ]]; then|g' /opt/frigate/docker/main/build_sqlite_vec.sh
+    sed -i 's/if.*"$VERSION_ID" == "12".*/if [[ "$VERSION_ID" =~ ^(12|13)$ ]]; then/g' /opt/frigate/docker/main/build_sqlite_vec.sh
 
     # Try building SQLite with verbose output
     if bash /opt/frigate/docker/main/build_sqlite_vec.sh; then
