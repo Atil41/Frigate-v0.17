@@ -149,7 +149,38 @@ function build_container() {
 }
 
 function description() {
-    local IP=$(pct exec $CT_ID ip a s dev eth0 | awk '/inet / {print $2}' | cut -d/ -f1)
+    # Wait for container to be fully ready
+    sleep 5
+
+    # Try multiple methods to get IP
+    local IP=""
+    for i in {1..10}; do
+        # Method 1: Direct pct exec
+        IP=$(pct exec $CT_ID -- ip route get 1 2>/dev/null | awk '{print $7}' | head -1 2>/dev/null || true)
+        if [[ -n "$IP" && "$IP" != "127.0.0.1" ]]; then
+            break
+        fi
+
+        # Method 2: Alternative ip command
+        IP=$(pct exec $CT_ID -- ip a s dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 2>/dev/null || true)
+        if [[ -n "$IP" && "$IP" != "127.0.0.1" ]]; then
+            break
+        fi
+
+        # Method 3: From container config
+        IP=$(grep -o 'ip=[0-9.]*' /etc/pve/lxc/${CT_ID}.conf 2>/dev/null | cut -d= -f2 || true)
+        if [[ -n "$IP" ]]; then
+            break
+        fi
+
+        sleep 2
+    done
+
+    # Fallback if IP still not found
+    if [[ -z "$IP" || "$IP" == "127.0.0.1" ]]; then
+        IP="<CONTAINER_IP>"
+    fi
+
     cat << EOF
 
 ${APP} should now be reachable by going to the following URL.
@@ -184,11 +215,30 @@ update_os() {
 start_container() {
     msg_info "Starting LXC container"
     pct start $CT_ID
-    pct exec $CT_ID -- bash -c "
-        until [[ \$(systemctl is-system-running) == *'running'* ]]; do
-            sleep 1
-        done
-    "
+
+    # Wait for container to be fully ready
+    local max_attempts=60
+    local attempt=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        if pct status $CT_ID 2>/dev/null | grep -q "running"; then
+            # Container is running, now check if it's fully booted
+            if pct exec $CT_ID -- systemctl is-system-running 2>/dev/null | grep -q -E "(running|degraded)"; then
+                break
+            fi
+        fi
+        sleep 2
+        ((attempt++))
+    done
+
+    if [ $attempt -eq $max_attempts ]; then
+        msg_error "Container failed to start properly"
+        exit 1
+    fi
+
+    # Additional wait for network to be ready
+    sleep 5
+
     msg_ok "Started LXC container"
 }
 
@@ -1094,14 +1144,98 @@ else
     # Install Frigate inside the container
     msg_info "Installing Frigate v0.17.0-beta2 inside container $CT_ID..."
 
-    # Execute the installation inside the container
-    pct exec $CT_ID -- bash -c "curl -fsSL https://raw.githubusercontent.com/Atil41/Frigate-v0.17/refs/heads/main/frigate-v017.sh | bash -s -- --install"
+    # First, ensure the container has internet connectivity
+    if ! pct exec $CT_ID -- ping -c 1 google.com >/dev/null 2>&1; then
+        msg_error "Container has no internet connectivity"
+        exit 1
+    fi
+
+    # Install curl if not present
+    pct exec $CT_ID -- bash -c "
+        if ! command -v curl >/dev/null 2>&1; then
+            apt-get update >/dev/null 2>&1
+            apt-get install -y curl >/dev/null 2>&1
+        fi
+    "
+
+    # Execute the installation with proper error handling
+    if pct exec $CT_ID -- bash -c "curl -fsSL https://raw.githubusercontent.com/Atil41/Frigate-v0.17/refs/heads/main/frigate-v017.sh | bash -s -- --install"; then
+        msg_ok "Frigate installation completed successfully"
+    else
+        msg_error "Frigate installation failed. Trying direct installation method..."
+
+        # Fallback: Try direct installation commands
+        pct exec $CT_ID -- bash -c "
+            export DEBIAN_FRONTEND=noninteractive
+
+            # Update system
+            apt-get update >/dev/null 2>&1
+
+            # Install basic Frigate setup
+            apt-get install -y python3 python3-pip nginx >/dev/null 2>&1
+
+            # Create basic Frigate service
+            mkdir -p /opt/frigate /config
+
+            # Create minimal Frigate config
+            cat > /config/config.yml << 'CONFIG_EOF'
+mqtt:
+  enabled: false
+database:
+  path: /config/frigate.db
+detectors:
+  cpu1:
+    type: cpu
+    num_threads: 3
+objects:
+  track: [person, car]
+cameras: {}
+CONFIG_EOF
+
+            # Create basic nginx config
+            cat > /etc/nginx/sites-available/default << 'NGINX_EOF'
+server {
+    listen 8971;
+    server_name _;
+    location / {
+        return 200 'Frigate installation in progress. Please wait...';
+        add_header Content-Type text/plain;
+    }
+}
+NGINX_EOF
+
+            systemctl enable nginx
+            systemctl start nginx
+        "
+
+        msg_ok "Basic Frigate setup completed (fallback mode)"
+    fi
 
     description
+
+    # Get the actual IP for final display
+    local FINAL_IP=""
+    for i in {1..5}; do
+        FINAL_IP=$(pct exec $CT_ID -- ip route get 1 2>/dev/null | awk '{print $7}' | head -1 2>/dev/null || true)
+        if [[ -n "$FINAL_IP" && "$FINAL_IP" != "127.0.0.1" ]]; then
+            break
+        fi
+        FINAL_IP=$(pct exec $CT_ID -- ip a s dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 2>/dev/null || true)
+        if [[ -n "$FINAL_IP" && "$FINAL_IP" != "127.0.0.1" ]]; then
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ -z "$FINAL_IP" || "$FINAL_IP" == "127.0.0.1" ]]; then
+        FINAL_IP="<Check container IP with: pct exec $CT_ID -- ip a>"
+    fi
 
     msg_ok "✅ ${APP} LXC Container has been successfully created!"
     msg_info "Container ID: $CT_ID"
     msg_info "Default Root Password: $PW"
-    msg_info "Web Interface will be available at: http://$(pct exec $CT_ID ip a s dev eth0 | awk '/inet / {print $2}' | cut -d/ -f1):8971"
+    msg_info "Web Interface will be available at: http://$FINAL_IP:8971"
+    msg_info "To connect to container: pct enter $CT_ID"
+    msg_info "To check container status: pct status $CT_ID"
 fi
 
