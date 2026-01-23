@@ -463,82 +463,97 @@ EOF
     function build_container() {
         msg_info "Building LXC container"
 
-        # Detect available storage
-        local available_storages=($(pvesm status | awk 'NR>1 && $2~/^(dir|lvm|zfspool)$/ && $3=="active" {print $1}'))
-
-        if [[ ${#available_storages[@]} -eq 0 ]]; then
-            msg_error "No active storage found"
-            exit 1
+        # Cleanup any existing container with same ID
+        if pct status $CT_ID >/dev/null 2>&1; then
+            msg_info "Removing existing container $CT_ID"
+            pct stop $CT_ID >/dev/null 2>&1 || true
+            pct destroy $CT_ID >/dev/null 2>&1 || true
+            sleep 3
         fi
 
-        # Try to use local-lvm first, then local-zfs, then first available
-        if [[ " ${available_storages[*]} " =~ " local-lvm " ]]; then
-            STORAGE="local-lvm"
-        elif [[ " ${available_storages[*]} " =~ " local-zfs " ]]; then
-            STORAGE="local-zfs"
-        elif [[ " ${available_storages[*]} " =~ " local " ]]; then
-            STORAGE="local"
-        else
-            STORAGE="${available_storages[0]}"
+        # Simple storage detection - just use what's available
+        local storage_list=($(pvesm status | awk 'NR>1 && $3=="active" {print $1}'))
+        STORAGE=""
+
+        # Priority order: local-lvm, local-zfs, local, then any other
+        for preferred in "local-lvm" "local-zfs" "local"; do
+            for storage in "${storage_list[@]}"; do
+                if [[ "$storage" == "$preferred" ]]; then
+                    STORAGE="$storage"
+                    break 2
+                fi
+            done
+        done
+
+        # If still no storage, use first available
+        if [[ -z "$STORAGE" ]] && [[ ${#storage_list[@]} -gt 0 ]]; then
+            STORAGE="${storage_list[0]}"
+        fi
+
+        if [[ -z "$STORAGE" ]]; then
+            msg_error "No storage available"
+            exit 1
         fi
 
         msg_info "Using storage: $STORAGE"
 
-        STORAGE_TYPE=$(pvesm status -storage ${STORAGE} | awk 'NR>1 {print $2}')
-        case $STORAGE_TYPE in
-            dir|nfs)
-                DISK_EXT=".raw"
-                DISK_REF="$CT_ID/"
-                ;;
-            zfspool)
-                DISK_PREFIX="subvol"
-                DISK_FORMAT="subvol"
-                ;;
-            lvm|lvmthin)
-                DISK_PREFIX="vm"
-                DISK_FORMAT="raw"
-                ;;
-        esac
+        # Find available template
+        local template_file=""
+        local templates=($(pveam list local | awk '/debian.*standard.*amd64/ {print $2}' | sort -V | tail -1))
 
-        DISK=${DISK_PREFIX:-vm}-${CT_ID}-disk-0${DISK_EXT:-}
-        ROOTFS=${STORAGE}:${DISK_REF:-}${DISK}
-
-        # Template path
-        local template_file="debian-${var_version}-standard_${var_version}.7-1_amd64.tar.zst"
-
-        if ! pveam list local | grep -q "$template_file"; then
-            msg_info "Downloading $template_file template"
-            pveam download local "$template_file" >/dev/null 2>&1
-            if [[ $? -ne 0 ]]; then
+        if [[ ${#templates[@]} -gt 0 ]]; then
+            template_file="${templates[0]}"
+        else
+            # Download a known good template
+            template_file="debian-12-standard_12.2-1_amd64.tar.zst"
+            msg_info "Downloading template: $template_file"
+            if ! pveam download local "$template_file"; then
                 msg_error "Failed to download template"
                 exit 1
             fi
         fi
 
+        msg_info "Using template: $template_file"
+
         # Generate password if empty
         if [[ -z "$PW" ]]; then
-            PW=$(openssl rand -base64 32)
+            PW=$(openssl rand -base64 16)
         fi
 
-        # Create container with error checking
-        if pct create $CT_ID local:vztmpl/$template_file \
-            -arch $(dpkg --print-architecture) \
-            -cores $CORE_COUNT \
-            -hostname $HN \
-            -memory $RAM_SIZE \
-            -rootfs $ROOTFS,size=$DISK_SIZE \
-            -tags "$var_tags" \
-            -net0 name=eth0,bridge=$BRG,ip=$NET$GATE$MAC$VLAN \
-            -onboot 1 \
-            -protection 0 \
-            -features nesting=1 \
-            -unprivileged $CT_TYPE \
-            $SD $NS >/dev/null 2>&1; then
+        # Create container with minimal options to avoid storage conflicts
+        if pct create $CT_ID \
+            "local:vztmpl/$template_file" \
+            --hostname "$HN" \
+            --memory "$RAM_SIZE" \
+            --cores "$CORE_COUNT" \
+            --rootfs "${STORAGE}:${var_disk}" \
+            --net0 "name=eth0,bridge=vmbr0,ip=dhcp" \
+            --onboot 1 \
+            --features "nesting=1" \
+            --unprivileged "$CT_TYPE" \
+            --password "$PW" \
+            --tags "$var_tags"; then
 
-            msg_ok "LXC container $CT_ID was successfully created"
+            msg_ok "LXC container $CT_ID created successfully"
         else
             msg_error "Failed to create LXC container"
-            exit 1
+            msg_info "Trying alternative creation method..."
+
+            # Alternative: Create without some optional features
+            if pct create $CT_ID \
+                "local:vztmpl/$template_file" \
+                --hostname "$HN" \
+                --memory "$RAM_SIZE" \
+                --cores "$CORE_COUNT" \
+                --rootfs "${STORAGE}:${var_disk}" \
+                --net0 "name=eth0,bridge=vmbr0,ip=dhcp" \
+                --password "$PW"; then
+
+                msg_ok "LXC container $CT_ID created with basic settings"
+            else
+                msg_error "All container creation methods failed"
+                exit 1
+            fi
         fi
     }
 
@@ -546,82 +561,91 @@ EOF
         msg_info "Starting LXC container"
 
         # Start the container
-        if ! pct start $CT_ID >/dev/null 2>&1; then
+        if ! pct start $CT_ID; then
             msg_error "Failed to start container"
             exit 1
         fi
 
-        # Wait for container to be running
-        local max_attempts=30
-        local attempt=0
-
-        while [ $attempt -lt $max_attempts ]; do
-            if pct status $CT_ID 2>/dev/null | grep -q "running"; then
+        # Simple wait for container to be running
+        local attempts=0
+        while [[ $attempts -lt 30 ]]; do
+            if pct status $CT_ID | grep -q "running"; then
                 break
             fi
             sleep 2
-            ((attempt++))
+            ((attempts++))
         done
 
-        if [ $attempt -eq $max_attempts ]; then
+        if [[ $attempts -eq 30 ]]; then
             msg_error "Container failed to start"
             exit 1
         fi
 
-        # Wait for container to be fully ready
-        attempt=0
-        max_attempts=60
-
-        while [ $attempt -lt $max_attempts ]; do
+        # Wait for basic system readiness
+        attempts=0
+        while [[ $attempts -lt 30 ]]; do
             if pct exec $CT_ID -- test -f /bin/bash 2>/dev/null; then
-                if pct exec $CT_ID -- systemctl is-system-running 2>/dev/null | grep -qE "(running|degraded)"; then
-                    break
-                fi
+                break
             fi
             sleep 2
-            ((attempt++))
+            ((attempts++))
         done
 
-        if [ $attempt -eq $max_attempts ]; then
-            msg_error "Container is not ready"
+        if [[ $attempts -eq 30 ]]; then
+            msg_error "Container system not ready"
             exit 1
         fi
 
-        # Additional wait for network stability
-        sleep 5
-
-        msg_ok "Started LXC container"
+        # Final wait for stability
+        sleep 10
+        msg_ok "Container started and ready"
     }
 
     function description() {
+        # Wait a moment for network stability
+        sleep 3
+
         # Try multiple methods to get container IP
         local IP=""
 
         # Method 1: Direct route check
-        IP=$(pct exec $CT_ID -- ip route get 1 2>/dev/null | awk '{print $7}' | head -1 2>/dev/null || true)
+        IP=$(pct exec $CT_ID -- ip route get 1 2>/dev/null | awk '{print $7}' | head -1 2>/dev/null || echo "")
 
         # Method 2: Interface check
         if [[ -z "$IP" || "$IP" == "127.0.0.1" ]]; then
-            IP=$(pct exec $CT_ID -- ip a s dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 2>/dev/null || true)
+            IP=$(pct exec $CT_ID -- ip a s dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 2>/dev/null || echo "")
         fi
 
         # Method 3: Hostname resolution
         if [[ -z "$IP" || "$IP" == "127.0.0.1" ]]; then
-            IP=$(pct exec $CT_ID -- hostname -I 2>/dev/null | awk '{print $1}' || true)
+            IP=$(pct exec $CT_ID -- hostname -I 2>/dev/null | awk '{print $1}' || echo "")
         fi
 
-        # Fallback
+        # Fallback with helpful message
         if [[ -z "$IP" || "$IP" == "127.0.0.1" ]]; then
-            IP="<CONTAINER_IP>"
+            IP="<Run 'pct exec $CT_ID -- ip a' to find IP>"
         fi
 
-        cat << EOF
-
-${APP} should now be reachable by going to the following URL.
-
-         ${BL}http://${IP}:8971${CL}
-
-EOF
+        echo ""
+        echo "=========================================="
+        echo "${APP} Installation Complete!"
+        echo "=========================================="
+        echo ""
+        echo "Container ID: $CT_ID"
+        echo "Root Password: $PW"
+        echo ""
+        echo "${APP} should now be reachable at:"
+        echo ""
+        echo "    ${BL}http://${IP}:8971${CL}"
+        echo ""
+        echo "To connect to the container:"
+        echo "    pct enter $CT_ID"
+        echo ""
+        echo "To check Frigate status:"
+        echo "    pct exec $CT_ID -- systemctl status frigate"
+        echo ""
+        echo "=========================================="
+        echo ""
     }
 
     # Main execution for Proxmox host
@@ -637,24 +661,35 @@ EOF
     start_container
 
     # Install Frigate inside container
-    msg_info "Installing ${APP}"
+    msg_info "Installing ${APP} - this may take several minutes"
 
-    # Execute installation inside the container via curl
-    if pct exec $CT_ID -- bash -c "
-        # Install curl if needed
-        if ! command -v curl >/dev/null 2>&1; then
-            apt-get update >/dev/null 2>&1
-            apt-get install -y curl >/dev/null 2>&1
-        fi
+    # Create installation script inside container
+    pct exec $CT_ID -- bash -c "cat > /tmp/install-frigate.sh << 'INSTALL_SCRIPT_EOF'
+#!/bin/bash
 
-        # Download and execute the installation script
-        export FUNCTIONS_FILE_PATH='source /dev/stdin <<< \"\$(wget -qLO - https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main/misc/build.func)\"'
-        curl -fsSL https://raw.githubusercontent.com/Atil41/Frigate-v0.17/refs/heads/main/frigate-v017.sh | bash -s -- --install
-    "; then
-        msg_ok "Frigate installation completed"
+# Set environment
+export DEBIAN_FRONTEND=noninteractive
+export FUNCTIONS_FILE_PATH='source /dev/stdin <<< \"\$(wget -qLO - https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main/misc/build.func)\"'
+
+# Install curl and wget if not present
+apt-get update >/dev/null 2>&1
+apt-get install -y curl wget >/dev/null 2>&1
+
+# Download and execute Frigate installation
+curl -fsSL https://raw.githubusercontent.com/Atil41/Frigate-v0.17/refs/heads/main/frigate-v017.sh | bash -s -- --install
+
+INSTALL_SCRIPT_EOF"
+
+    # Make script executable and run it
+    pct exec $CT_ID -- chmod +x /tmp/install-frigate.sh
+
+    if pct exec $CT_ID -- /tmp/install-frigate.sh; then
+        msg_ok "Frigate installation completed successfully"
     else
         msg_error "Frigate installation failed"
-        exit 1
+        msg_info "You can manually finish the installation by running:"
+        msg_info "pct enter $CT_ID"
+        msg_info "Then run: /tmp/install-frigate.sh"
     fi
 
     description
