@@ -7,6 +7,16 @@
 # Source: https://frigate.video/
 # Version: Frigate v0.17.0-beta2
 
+APP="Frigate"
+var_tags="nvr;ai;cctv"
+var_cpu="4"
+var_ram="4096"
+var_disk="20"
+var_os="debian"
+var_version="12"
+var_unprivileged="1"
+var_gpu="yes"
+
 # Define essential functions for standalone operation
 BL='\033[36m'    # Blue
 RD='\033[0;31m'  # Red
@@ -21,10 +31,143 @@ msg_info() { echo -e "${BL}[INFO]${CL} $1"; }
 msg_ok() { echo -e "${BFR}${CM} ${GN}$1${CL}"; }
 msg_error() { echo -e "${BFR}${CROSS} ${RD}$1${CL}"; }
 
+# Community-scripts compatibility functions
+NSAPP=$(echo ${APP,,} | tr -d ' ')
+var_install="${NSAPP}-install"
+timezone=$(cat /etc/timezone)
+NEXTID=$(pvesh get /cluster/nextid)
+TEMPLATE="debian-${var_version}-standard_${var_version}.7-1_amd64.tar.zst"
+
+function header_info() {
+    clear
+    cat <<"EOF"
+    ______     _             __
+   / ____/____(_)___ _____ _/ /____
+  / /_  / ___/ / __ `/ __ `/ __/ _ \
+ / __/ / /  / / /_/ / /_/ / /_/  __/
+/_/   /_/  /_/\__, /\__,_/\__/\___/
+             /____/
+                              v0.17.0-beta2
+EOF
+}
+
+function default_settings() {
+    CT_TYPE="$var_unprivileged"
+    PW=""
+    CT_ID=$NEXTID
+    HN=$NSAPP
+    DISK_SIZE="$var_disk"
+    CORE_COUNT="$var_cpu"
+    RAM_SIZE="$var_ram"
+    BRG="vmbr0"
+    NET="dhcp"
+    GATE=""
+    APT_CACHER=""
+    APT_CACHER_IP=""
+    DISABLEIP6="no"
+    MTU=""
+    SD=""
+    NS=""
+    MAC=""
+    VLAN=""
+    SSH="no"
+    VERB="no"
+}
+
+function update_script() {
+    header_info
+    if [[ ! -f /etc/systemd/system/frigate.service ]]; then
+        msg_error "No ${APP} Installation Found!"
+        exit
+    fi
+    msg_error "To update ${APP}, create a new container and migrate the configuration."
+    exit
+}
+
+function start_script() {
+    if command -v pveversion >/dev/null 2>&1; then
+        if ! (whiptail --title "${APP} LXC" --yesno "This will create a New ${APP} LXC. Proceed?" 10 58); then
+            clear
+            exit
+        fi
+        NEXTID=$(pvesh get /cluster/nextid)
+    else
+        if ! (whiptail --title "${APP} LXC" --yesno "This will create a New ${APP} LXC. Proceed?" 10 58); then
+            clear
+            exit
+        fi
+        NEXTID="$(($RANDOM * 2 / 32767 + 100))"
+    fi
+}
+
+function build_container() {
+    msg_info "Building LXC container"
+
+    # Get template if not available
+    if ! pveam list local | grep -q "$TEMPLATE"; then
+        msg_info "Downloading $TEMPLATE Template"
+        pveam download local $TEMPLATE >/dev/null 2>&1
+        msg_ok "Downloaded $TEMPLATE Template"
+    fi
+
+    STORAGE_TYPE=$(pvesm status -storage local-lvm | awk 'NR>1 {print $2}')
+    case $STORAGE_TYPE in
+        dir|nfs)
+            DISK_EXT=".raw"
+            DISK_REF="$CT_ID/"
+            ;;
+        zfspool)
+            DISK_PREFIX="subvol"
+            DISK_FORMAT="subvol"
+            ;;
+    esac
+
+    DISK=${DISK_PREFIX:-vm}-${CT_ID}-disk-0${DISK_EXT:-}
+    ROOTFS=local-lvm:${DISK_REF:-}${DISK}
+
+    # Generate random password if not provided
+    if [[ -z "$PW" ]]; then
+        PW=$(openssl rand -base64 32)
+    fi
+
+    # Create container
+    pct create $CT_ID local:vztmpl/$TEMPLATE \
+        -arch $(dpkg --print-architecture) \
+        -cores $CORE_COUNT \
+        -hostname $HN \
+        -memory $RAM_SIZE \
+        -rootfs $ROOTFS,size=$DISK_SIZE \
+        -tags "$var_tags" \
+        -net0 name=eth0,bridge=$BRG,ip=$NET$GATE$MAC$VLAN \
+        -onboot 1 \
+        -protection 0 \
+        -features nesting=1 \
+        -unprivileged $CT_TYPE \
+        $SD $NS >/dev/null
+
+    msg_ok "LXC container $CT_ID created successfully"
+}
+
+function description() {
+    local IP=$(pct exec $CT_ID ip a s dev eth0 | awk '/inet / {print $2}' | cut -d/ -f1)
+    cat << EOF
+
+${APP} should now be reachable by going to the following URL.
+
+         ${BL}http://${IP}:8971${CL}
+
+EOF
+}
+
+color() { return 0; }
+verb_ip6() { return 0; }
+catch_errors() { set -euo pipefail; }
+
 color() { return 0; }
 verb_ip6() { return 0; }
 catch_errors() { set -euo pipefail; }
 setting_up_container() { echo -e "${BL}[INFO]${CL} Setting up Frigate v0.17.0-beta2 container..."; }
+
 network_check() {
     if ! ping -c 1 google.com &> /dev/null; then
         msg_error "No internet connection available"
@@ -36,6 +179,17 @@ update_os() {
     msg_info "Updating package repositories"
     apt-get update &> /dev/null || { msg_error "Failed to update repositories"; exit 1; }
     msg_ok "Package repositories updated"
+}
+
+start_container() {
+    msg_info "Starting LXC container"
+    pct start $CT_ID
+    pct exec $CT_ID -- bash -c "
+        until [[ \$(systemctl is-system-running) == *'running'* ]]; do
+            sleep 1
+        done
+    "
+    msg_ok "Started LXC container"
 }
 
 setup_hwaccel() {
@@ -164,14 +318,20 @@ set +e
 # Define STD for silent operations
 STD="&>/dev/null"
 
-color
-verb_ip6
-catch_errors
-setting_up_container
-network_check
-update_os
+# Check if we're running inside a container (installation phase) or on Proxmox host (creation phase)
+if [[ -f /.dockerenv ]] || [[ -f /run/.containerenv ]] || [[ "$1" == "--install" ]]; then
+    # We're inside a container, run the installation
+    msg_info "Running Frigate v0.17.0-beta2 installation inside container..."
 
-cat <<'EOF' >/etc/apt/sources.list.d/debian.sources
+    color
+    verb_ip6
+    catch_errors
+    setting_up_container
+    network_check
+    update_os
+
+    # Installation code starts here
+    cat <<'EOF' >/etc/apt/sources.list.d/debian.sources
 Types: deb deb-src
 URIs: http://deb.debian.org/debian
 Suites: bookworm
@@ -911,3 +1071,37 @@ msg_ok "Cleanup completed"
 motd_ssh
 customize
 cleanup_lxc
+
+else
+    # We're on Proxmox host, create container and install
+    header_info
+    echo "This script will create a new LXC Container with the latest version of ${APP}."
+    echo "Press any key to continue..."
+    read -n 1 -s
+    echo ""
+
+    # Initialize Proxmox functions
+    if ! command -v pct >/dev/null 2>&1; then
+        msg_error "This script must be run on a Proxmox VE host!"
+        exit 1
+    fi
+
+    start_script
+    default_settings
+    build_container
+    start_container
+
+    # Install Frigate inside the container
+    msg_info "Installing Frigate v0.17.0-beta2 inside container $CT_ID..."
+
+    # Execute the installation inside the container
+    pct exec $CT_ID -- bash -c "curl -fsSL https://raw.githubusercontent.com/Atil41/Frigate-v0.17/refs/heads/main/frigate-v017.sh | bash -s -- --install"
+
+    description
+
+    msg_ok "✅ ${APP} LXC Container has been successfully created!"
+    msg_info "Container ID: $CT_ID"
+    msg_info "Default Root Password: $PW"
+    msg_info "Web Interface will be available at: http://$(pct exec $CT_ID ip a s dev eth0 | awk '/inet / {print $2}' | cut -d/ -f1):8971"
+fi
+
