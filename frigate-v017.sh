@@ -7,8 +7,163 @@
 # Source: https://frigate.video/
 # Version: Frigate v0.17.0-beta2
 
-source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
+# Define essential functions for standalone operation
+BL='\033[36m'    # Blue
+RD='\033[0;31m'  # Red
+YW='\033[1;33m'  # Yellow
+GN='\033[0;32m'  # Green
+CL='\033[0m'     # Clear
+BFR='\r\033[K'   # Clear line
+CM="${GN}✓${CL}" # Check mark
+CROSS="${RD}✗${CL}" # Cross mark
+
+msg_info() { echo -e "${BL}[INFO]${CL} $1"; }
+msg_ok() { echo -e "${BFR}${CM} ${GN}$1${CL}"; }
+msg_error() { echo -e "${BFR}${CROSS} ${RD}$1${CL}"; }
+
+color() { return 0; }
+verb_ip6() { return 0; }
+catch_errors() { set -euo pipefail; }
+setting_up_container() { echo -e "${BL}[INFO]${CL} Setting up Frigate v0.17.0-beta2 container..."; }
+network_check() {
+    if ! ping -c 1 google.com &> /dev/null; then
+        msg_error "No internet connection available"
+        exit 1
+    fi
+}
+
+update_os() {
+    msg_info "Updating package repositories"
+    apt-get update &> /dev/null || { msg_error "Failed to update repositories"; exit 1; }
+    msg_ok "Package repositories updated"
+}
+
+setup_hwaccel() {
+    msg_info "Setting up hardware acceleration support"
+    # Install VA-API and other hardware acceleration packages
+    apt-get install -y vainfo intel-media-va-driver-non-free mesa-va-drivers &> /dev/null || true
+    msg_ok "Hardware acceleration configured"
+}
+
+setup_nodejs() {
+    local NODE_VERSION=$1
+    local NODE_MODULE=$2
+    msg_info "Installing Node.js $NODE_VERSION"
+
+    # Install Node.js
+    curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - &> /dev/null
+    apt-get install -y nodejs &> /dev/null
+
+    # Install specified module (yarn)
+    if [[ "$NODE_MODULE" == "yarn" ]]; then
+        npm install -g yarn &> /dev/null
+    fi
+
+    msg_ok "Node.js $NODE_VERSION and $NODE_MODULE installed"
+}
+
+fetch_and_deploy_gh_release() {
+    local name="$1"
+    local repo="$2"
+    local type="$3"
+    local version="$4"
+    local dest="$5"
+    local filename="${6:-}"
+
+    msg_info "Fetching $name from GitHub ($version)"
+
+    mkdir -p "$dest"
+    cd /tmp
+
+    case "$type" in
+        "tarball")
+            wget -q "https://github.com/$repo/archive/refs/tags/$version.tar.gz" -O "${name}.tar.gz"
+            tar -xzf "${name}.tar.gz" --strip-components=1 -C "$dest"
+            rm "${name}.tar.gz"
+            ;;
+        "singlefile")
+            if [[ "$version" == "latest" ]]; then
+                local download_url=$(curl -s "https://api.github.com/repos/$repo/releases/latest" | grep "browser_download_url.*$filename" | cut -d '"' -f 4)
+            else
+                local download_url="https://github.com/$repo/releases/download/$version/$filename"
+            fi
+            wget -q "$download_url" -O "$dest/$filename"
+            chmod +x "$dest/$filename"
+            ln -sf "$dest/$filename" "/usr/local/bin/go2rtc"
+            ;;
+    esac
+
+    msg_ok "$name deployed to $dest"
+}
+
+motd_ssh() {
+    msg_info "Configuring MOTD and SSH"
+
+    # Create custom MOTD
+    cat > /etc/motd << EOF
+   ______     _             __
+  / ____/____(_)___ _____ _/ /____
+ / /_  / ___/ / __ \`/ __ \`/ __/ _ \\
+/ __/ / /  / / /_/ / /_/ / /_/  __/
+/_/   /_/  /_/\\__, /\\__,_/\\__/\\___/
+             /____/
+                              v0.17.0-beta2
+
+Documentation: https://docs.frigate.video/
+Configuration: /config/config.yml
+Web Interface: http://$(hostname -I | awk '{print $1}'):8971
+
+EOF
+
+    msg_ok "MOTD configured"
+}
+
+customize() {
+    msg_info "Applying container customizations"
+
+    # Set timezone
+    timedatectl set-timezone Europe/Paris &> /dev/null || true
+
+    # Configure system limits for Frigate
+    cat >> /etc/security/limits.conf << EOF
+*       soft    nofile  1048576
+*       hard    nofile  1048576
+root    soft    nofile  1048576
+root    hard    nofile  1048576
+EOF
+
+    # Configure sysctl for better performance
+    cat >> /etc/sysctl.conf << EOF
+vm.swappiness=1
+vm.dirty_background_ratio=5
+vm.dirty_ratio=10
+EOF
+
+    msg_ok "Container customization completed"
+}
+
+cleanup_lxc() {
+    msg_info "Performing final cleanup"
+
+    # Clean package cache
+    apt-get autoremove -y &> /dev/null || true
+    apt-get autoclean &> /dev/null || true
+
+    # Clear logs
+    find /var/log -type f -name "*.log" -exec truncate -s 0 {} \; 2> /dev/null || true
+
+    # Clear bash history
+    history -c &> /dev/null || true
+
+    msg_ok "LXC container cleanup completed"
+}
+
+# Set error handling and initialize
 set +e
+
+# Define STD for silent operations
+STD="&>/dev/null"
+
 color
 verb_ip6
 catch_errors
@@ -38,12 +193,13 @@ EOF
 rm -f /etc/apt/sources.list
 
 msg_info "Installing system dependencies"
-$STD apt-get install -y jq wget xz-utils python3 python3-dev python3-pip gcc pkg-config libhdf5-dev unzip build-essential automake libtool ccache libusb-1.0-0-dev apt-transport-https cmake git libgtk-3-dev libavcodec-dev libavformat-dev libswscale-dev libv4l-dev libxvidcore-dev libx264-dev libjpeg-dev libpng-dev libtiff-dev gfortran openexr libssl-dev libtbbmalloc2 libtbb-dev libdc1394-dev libopenexr-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev tclsh libopenblas-dev liblapack-dev make moreutils
+eval apt-get install -y jq wget xz-utils python3 python3-dev python3-pip gcc pkg-config libhdf5-dev unzip build-essential automake libtool ccache libusb-1.0-0-dev apt-transport-https cmake git libgtk-3-dev libavcodec-dev libavformat-dev libswscale-dev libv4l-dev libxvidcore-dev libx264-dev libjpeg-dev libpng-dev libtiff-dev gfortran openexr libssl-dev libtbbmalloc2 libtbb-dev libdc1394-dev libopenexr-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev tclsh libopenblas-dev liblapack-dev make moreutils $STD
 msg_ok "System dependencies installed"
 
 setup_hwaccel
 
-if [[ "$CTTYPE" == "0" ]]; then
+# Check if we're in privileged or unprivileged container
+if [[ "${CTTYPE:-1}" == "0" ]]; then
   msg_info "Configuring render group for privileged container"
   sed -i -e 's/^kvm:x:104:$/render:x:104:root,frigate/' -e 's/^render:x:105:root$/kvm:x:105:/' /etc/group
   msg_ok "Privileged container GPU access configured"
@@ -70,14 +226,14 @@ fetch_and_deploy_gh_release "frigate" "blakeblackshear/frigate" "tarball" "v0.17
 
 msg_info "Building Nginx with custom modules"
 #sed -i 's|if.*"$VERSION_ID" == "12".*|if [[ "$VERSION_ID" =~ ^(12|13)$ ]]; then|g' /opt/frigate/docker/main/build_nginx.sh
-$STD bash /opt/frigate/docker/main/build_nginx.sh
+eval bash /opt/frigate/docker/main/build_nginx.sh $STD
 sed -e '/s6-notifyoncheck/ s/^#*/#/' -i /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/nginx/run
 ln -sf /usr/local/nginx/sbin/nginx /usr/local/bin/nginx
 msg_ok "Nginx built successfully"
 
 msg_info "Building SQLite with custom modules"
 #sed -i 's|if.*"$VERSION_ID" == "12".*|if [[ "$VERSION_ID" =~ ^(12|13)$ ]]; then|g' /opt/frigate/docker/main/build_sqlite_vec.sh
-$STD bash /opt/frigate/docker/main/build_sqlite_vec.sh
+eval bash /opt/frigate/docker/main/build_sqlite_vec.sh $STD
 msg_ok "SQLite built successfully"
 
 fetch_and_deploy_gh_release "go2rtc" "AlexxIT/go2rtc" "singlefile" "latest" "/usr/local/go2rtc/bin" "go2rtc_linux_amd64"
@@ -85,26 +241,26 @@ fetch_and_deploy_gh_release "go2rtc" "AlexxIT/go2rtc" "singlefile" "latest" "/us
 msg_info "Installing tempio"
 export TARGETARCH=amd64
 sed -i 's|/rootfs/usr/local|/usr/local|g' /opt/frigate/docker/main/install_tempio.sh
-$STD bash /opt/frigate/docker/main/install_tempio.sh
+eval bash /opt/frigate/docker/main/install_tempio.sh $STD
 ln -sf /usr/local/tempio/bin/tempio /usr/local/bin/tempio
 msg_ok "tempio installed"
 
 msg_info "Building libUSB without udev"
 cd /opt
 wget -q https://github.com/libusb/libusb/archive/v1.0.26.zip -O v1.0.26.zip
-$STD unzip -q v1.0.26.zip
+eval unzip -q v1.0.26.zip $STD
 cd libusb-1.0.26
-$STD ./bootstrap.sh
-$STD ./configure CC='ccache gcc' CCX='ccache g++' --disable-udev --enable-shared
-$STD make -j $(nproc --all)
+eval ./bootstrap.sh $STD
+eval ./configure CC='ccache gcc' CCX='ccache g++' --disable-udev --enable-shared $STD
+eval make -j $(nproc --all) $STD
 cd /opt/libusb-1.0.26/libusb
 mkdir -p '/usr/local/lib'
-$STD bash ../libtool --mode=install /usr/bin/install -c libusb-1.0.la '/usr/local/lib'
+eval bash ../libtool --mode=install /usr/bin/install -c libusb-1.0.la '/usr/local/lib' $STD
 mkdir -p '/usr/local/include/libusb-1.0'
-$STD install -c -m 644 libusb.h '/usr/local/include/libusb-1.0'
+eval install -c -m 644 libusb.h '/usr/local/include/libusb-1.0' $STD
 mkdir -p '/usr/local/lib/pkgconfig'
 cd /opt/libusb-1.0.26/
-$STD install -c -m 644 libusb-1.0.pc '/usr/local/lib/pkgconfig'
+eval install -c -m 644 libusb-1.0.pc '/usr/local/lib/pkgconfig' $STD
 ldconfig
 msg_ok "libUSB built successfully"
 
@@ -119,16 +275,18 @@ msg_ok "libUSB built successfully"
 #msg_ok "Pip initialized"
 
 msg_info "Installing Python dependencies from requirements"
-$STD pip3 install -r /opt/frigate/docker/main/requirements.txt
+eval pip3 install -r /opt/frigate/docker/main/requirements.txt $STD
 msg_ok "Python dependencies installed"
 
 msg_info "Building pysqlite3"
 sed -i 's|^SQLITE3_VERSION=.*|SQLITE3_VERSION="version-3.46.0"|g' /opt/frigate/docker/main/build_pysqlite3.sh
-$STD bash /opt/frigate/docker/main/build_pysqlite3.sh
+eval bash /opt/frigate/docker/main/build_pysqlite3.sh $STD
 mkdir -p /wheels
 for i in {1..3}; do
   msg_info "Building wheels (attempt $i/3)..."
-  pip3 wheel --wheel-dir=/wheels -r /opt/frigate/docker/main/requirements-wheels.txt --default-timeout=300 --retries=3 && break
+  if pip3 wheel --wheel-dir=/wheels -r /opt/frigate/docker/main/requirements-wheels.txt --default-timeout=300 --retries=3 &>/dev/null; then
+    break
+  fi
   if [[ $i -lt 3 ]]; then sleep 10; fi
 done
 msg_ok "pysqlite3 built successfully"
@@ -146,33 +304,33 @@ msg_ok "Inference models downloaded"
 msg_info "Downloading audio classification model"
 cd /
 wget -q -O yamnet-tflite.tar.gz https://www.kaggle.com/api/v1/models/google/yamnet/tfLite/classification-tflite/1/download
-$STD tar xzf yamnet-tflite.tar.gz
+eval tar xzf yamnet-tflite.tar.gz $STD
 mv 1.tflite cpu_audio_model.tflite
 cp /opt/frigate/audio-labelmap.txt /audio-labelmap.txt
 rm -f yamnet-tflite.tar.gz
 msg_ok "Audio model prepared"
 
 msg_info "Building HailoRT runtime"
-$STD bash /opt/frigate/docker/main/install_hailort.sh
+eval bash /opt/frigate/docker/main/install_hailort.sh $STD
 cp -a /opt/frigate/docker/main/rootfs/. /
 sed -i '/^.*unset DEBIAN_FRONTEND.*$/d' /opt/frigate/docker/main/install_deps.sh
 echo "libedgetpu1-max libedgetpu/accepted-eula boolean true" | debconf-set-selections
 echo "libedgetpu1-max libedgetpu/install-confirm-max boolean true" | debconf-set-selections
-$STD bash /opt/frigate/docker/main/install_deps.sh
-$STD pip3 install -U /wheels/*.whl
+eval bash /opt/frigate/docker/main/install_deps.sh $STD
+eval pip3 install -U /wheels/*.whl $STD
 ldconfig
-$STD pip3 install -U /wheels/*.whl
+eval pip3 install -U /wheels/*.whl $STD
 msg_ok "HailoRT runtime built"
 
 msg_info "Installing OpenVino runtime and libraries"
-$STD pip3 install -r /opt/frigate/docker/main/requirements-ov.txt
+eval pip3 install -r /opt/frigate/docker/main/requirements-ov.txt $STD
 msg_ok "OpenVino installed"
 
 msg_info "Preparing OpenVino inference model"
 cd /models
 wget -q http://download.tensorflow.org/models/object_detection/ssdlite_mobilenet_v2_coco_2018_05_09.tar.gz
-$STD tar -zxf ssdlite_mobilenet_v2_coco_2018_05_09.tar.gz --no-same-owner
-$STD python3 /opt/frigate/docker/main/build_ov_model.py
+eval tar -zxf ssdlite_mobilenet_v2_coco_2018_05_09.tar.gz --no-same-owner $STD
+eval python3 /opt/frigate/docker/main/build_ov_model.py $STD
 cp -r /models/ssdlite_mobilenet_v2.xml /openvino-model/
 cp -r /models/ssdlite_mobilenet_v2.bin /openvino-model/
 wget -q https://github.com/openvinotoolkit/open_model_zoo/raw/master/data/dataset_classes/coco_91cl_bkgr.txt -O /openvino-model/coco_91cl_bkgr.txt
@@ -181,12 +339,12 @@ msg_ok "OpenVino model prepared"
 
 msg_info "Building Frigate application"
 cd /opt/frigate
-$STD pip3 install -r /opt/frigate/docker/main/requirements-dev.txt
-$STD bash /opt/frigate/.devcontainer/initialize.sh
-$STD make version
+eval pip3 install -r /opt/frigate/docker/main/requirements-dev.txt $STD
+eval bash /opt/frigate/.devcontainer/initialize.sh $STD
+eval make version $STD
 cd /opt/frigate/web
-$STD npm install
-$STD npm run build
+eval npm install $STD
+eval npm run build $STD
 cp -r /opt/frigate/web/dist/* /opt/frigate/web/
 cd /opt/frigate
 sed -i '/^s6-svc -O \.$/s/^/#/' /opt/frigate/docker/main/rootfs/etc/s6-overlay/s6-rc.d/frigate/run
@@ -515,7 +673,7 @@ StandardError=file:/dev/shm/logs/nginx/current
 WantedBy=multi-user.target
 EOF
 
-$STD systemctl daemon-reload
+eval systemctl daemon-reload $STD
 systemctl enable -q --now create_directories
 sleep 2
 systemctl enable -q --now go2rtc
@@ -527,8 +685,8 @@ msg_ok "Systemd services created and enabled for Frigate v0.17.0-beta2"
 
 msg_info "Cleaning up temporary files and caches"
 rm -rf /opt/v*.zip /opt/libusb-1.0.26 /tmp/get-pip.py
-$STD apt-get -y autoremove
-$STD apt-get -y autoclean
+eval apt-get -y autoremove $STD
+eval apt-get -y autoclean $STD
 msg_ok "Cleanup completed"
 
 motd_ssh
