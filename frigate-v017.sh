@@ -463,6 +463,27 @@ EOF
     function build_container() {
         msg_info "Building LXC container"
 
+        # Detect available storage
+        local available_storages=($(pvesm status | awk 'NR>1 && $2~/^(dir|lvm|zfspool)$/ && $3=="active" {print $1}'))
+
+        if [[ ${#available_storages[@]} -eq 0 ]]; then
+            msg_error "No active storage found"
+            exit 1
+        fi
+
+        # Try to use local-lvm first, then local-zfs, then first available
+        if [[ " ${available_storages[*]} " =~ " local-lvm " ]]; then
+            STORAGE="local-lvm"
+        elif [[ " ${available_storages[*]} " =~ " local-zfs " ]]; then
+            STORAGE="local-zfs"
+        elif [[ " ${available_storages[*]} " =~ " local " ]]; then
+            STORAGE="local"
+        else
+            STORAGE="${available_storages[0]}"
+        fi
+
+        msg_info "Using storage: $STORAGE"
+
         STORAGE_TYPE=$(pvesm status -storage ${STORAGE} | awk 'NR>1 {print $2}')
         case $STORAGE_TYPE in
             dir|nfs)
@@ -472,6 +493,10 @@ EOF
             zfspool)
                 DISK_PREFIX="subvol"
                 DISK_FORMAT="subvol"
+                ;;
+            lvm|lvmthin)
+                DISK_PREFIX="vm"
+                DISK_FORMAT="raw"
                 ;;
         esac
 
@@ -483,7 +508,11 @@ EOF
 
         if ! pveam list local | grep -q "$template_file"; then
             msg_info "Downloading $template_file template"
-            pveam download local "$template_file"
+            pveam download local "$template_file" >/dev/null 2>&1
+            if [[ $? -ne 0 ]]; then
+                msg_error "Failed to download template"
+                exit 1
+            fi
         fi
 
         # Generate password if empty
@@ -491,7 +520,8 @@ EOF
             PW=$(openssl rand -base64 32)
         fi
 
-        pct create $CT_ID local:vztmpl/$template_file \
+        # Create container with error checking
+        if pct create $CT_ID local:vztmpl/$template_file \
             -arch $(dpkg --print-architecture) \
             -cores $CORE_COUNT \
             -hostname $HN \
@@ -503,24 +533,88 @@ EOF
             -protection 0 \
             -features nesting=1 \
             -unprivileged $CT_TYPE \
-            $SD $NS >/dev/null
+            $SD $NS >/dev/null 2>&1; then
 
-        msg_ok "LXC container $CT_ID was successfully created"
+            msg_ok "LXC container $CT_ID was successfully created"
+        else
+            msg_error "Failed to create LXC container"
+            exit 1
+        fi
     }
 
     function start_container() {
         msg_info "Starting LXC container"
-        pct start $CT_ID
-        pct exec $CT_ID -- bash -c "
-            until [[ \$(systemctl is-system-running) == *'running'* ]]; do
-                sleep 1
-            done
-        " || true
+
+        # Start the container
+        if ! pct start $CT_ID >/dev/null 2>&1; then
+            msg_error "Failed to start container"
+            exit 1
+        fi
+
+        # Wait for container to be running
+        local max_attempts=30
+        local attempt=0
+
+        while [ $attempt -lt $max_attempts ]; do
+            if pct status $CT_ID 2>/dev/null | grep -q "running"; then
+                break
+            fi
+            sleep 2
+            ((attempt++))
+        done
+
+        if [ $attempt -eq $max_attempts ]; then
+            msg_error "Container failed to start"
+            exit 1
+        fi
+
+        # Wait for container to be fully ready
+        attempt=0
+        max_attempts=60
+
+        while [ $attempt -lt $max_attempts ]; do
+            if pct exec $CT_ID -- test -f /bin/bash 2>/dev/null; then
+                if pct exec $CT_ID -- systemctl is-system-running 2>/dev/null | grep -qE "(running|degraded)"; then
+                    break
+                fi
+            fi
+            sleep 2
+            ((attempt++))
+        done
+
+        if [ $attempt -eq $max_attempts ]; then
+            msg_error "Container is not ready"
+            exit 1
+        fi
+
+        # Additional wait for network stability
+        sleep 5
+
         msg_ok "Started LXC container"
     }
 
     function description() {
-        IP=$(pct exec $CT_ID ip a s dev eth0 | awk '/inet / {print $2}' | cut -d/ -f1)
+        # Try multiple methods to get container IP
+        local IP=""
+
+        # Method 1: Direct route check
+        IP=$(pct exec $CT_ID -- ip route get 1 2>/dev/null | awk '{print $7}' | head -1 2>/dev/null || true)
+
+        # Method 2: Interface check
+        if [[ -z "$IP" || "$IP" == "127.0.0.1" ]]; then
+            IP=$(pct exec $CT_ID -- ip a s dev eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 2>/dev/null || true)
+        fi
+
+        # Method 3: Hostname resolution
+        if [[ -z "$IP" || "$IP" == "127.0.0.1" ]]; then
+            IP=$(pct exec $CT_ID -- hostname -I 2>/dev/null | awk '{print $1}' || true)
+        fi
+
+        # Fallback
+        if [[ -z "$IP" || "$IP" == "127.0.0.1" ]]; then
+            IP="<CONTAINER_IP>"
+        fi
+
         cat << EOF
 
 ${APP} should now be reachable by going to the following URL.
@@ -537,9 +631,6 @@ EOF
     read -n 1 -s
     echo ""
 
-    # Set default storage
-    STORAGE="local-lvm"
-
     start
     default_settings
     build_container
@@ -548,17 +639,23 @@ EOF
     # Install Frigate inside container
     msg_info "Installing ${APP}"
 
-    # Define FUNCTIONS_FILE_PATH for the container
-    FUNCTIONS_FILE_PATH=$(cat << 'FUNC_EOF'
-source /dev/stdin <<< "$(wget -qLO - https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main/misc/build.func)"
-FUNC_EOF
-)
+    # Execute installation inside the container via curl
+    if pct exec $CT_ID -- bash -c "
+        # Install curl if needed
+        if ! command -v curl >/dev/null 2>&1; then
+            apt-get update >/dev/null 2>&1
+            apt-get install -y curl >/dev/null 2>&1
+        fi
 
-    # Execute this script inside the container with --install flag
-    pct exec $CT_ID -- bash -c "
-        FUNCTIONS_FILE_PATH='$FUNCTIONS_FILE_PATH'
-        $(cat "$0")
-    " -- --install
+        # Download and execute the installation script
+        export FUNCTIONS_FILE_PATH='source /dev/stdin <<< \"\$(wget -qLO - https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main/misc/build.func)\"'
+        curl -fsSL https://raw.githubusercontent.com/Atil41/Frigate-v0.17/refs/heads/main/frigate-v017.sh | bash -s -- --install
+    "; then
+        msg_ok "Frigate installation completed"
+    else
+        msg_error "Frigate installation failed"
+        exit 1
+    fi
 
     description
     msg_ok "${APP} setup has been successfully initialized!"
